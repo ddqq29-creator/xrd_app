@@ -1,10 +1,10 @@
-#  python -m streamlit run xrd_app.py
-
 import streamlit as st
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, savgol_filter
 import re
+import io
 
 # --- コールバック関数（一括設定を個別設定に自動同期させる魔法） ---
 def sync_bulk_color(idx, n_peaks):
@@ -25,9 +25,33 @@ def sync_bulk_offset(idx, n_peaks):
         for j in range(n_peaks):
             st.session_state[f"off_{idx}_{j}"] = new_off
 
+# --- 【アップデート1】データ読み込みの高速化・万能化（キャッシュ機能付き） ---
+@st.cache_data
+def load_data(file_bytes):
+    # pandasを使ってカンマ、スペース、タブ区切りを自動判別して読み込む
+    content = file_bytes.decode('utf-8', errors='ignore')
+    lines = [line for line in content.split('\n') if not line.startswith('*')]
+    content_clean = '\n'.join(lines)
+    
+    df = pd.read_csv(io.StringIO(content_clean), sep=r'[,\s]+', engine='python', header=None)
+    x = df.iloc[:, 0].values
+    y = df.iloc[:, 1].values
+    return x, y
+
+# --- 【アップデート2】ノイズ除去と正規化処理のキャッシュ化 ---
+@st.cache_data
+def process_signal(y, apply_smooth, window, poly):
+    if apply_smooth and len(y) > window:
+        y_proc = savgol_filter(y, window, poly)
+    else:
+        y_proc = y
+    # 正規化
+    y_norm = (y_proc - np.min(y_proc)) / (np.max(y_proc) - np.min(y_proc))
+    return y_norm
+
 # --- 1. アプリの基本設定 ---
 st.set_page_config(page_title="XRD Data Analyzer", layout="wide")
-st.title("XRD Data Analyzer")
+st.title("XRD Data Analyzer (Pro)")
 
 # --- 2. サイドバー（4つのタブ） ---
 tab1, tab2, tab3, tab4 = st.sidebar.tabs(["1. 軸/範囲", "2. ピーク", "3. 凡例", "4. 個別データ"])
@@ -46,7 +70,6 @@ with tab1:
     y_max = st.number_input("最大値 (Intensity)", value=2.0, step=0.1)
     
     st.subheader("グラフの表示サイズ")
-    # 【追加】横幅のスライダー（初期値をこれまでの固定値だった10.0に設定）
     fig_width = st.slider("グラフの横幅", min_value=4.0, max_value=20.0, value=10.0, step=0.5)
     fig_height = st.slider("グラフの縦幅", min_value=4.0, max_value=12.0, value=6.0, step=0.5)
 
@@ -55,6 +78,14 @@ with tab2:
     st.header("ピークの全体設定")
     show_peaks = st.checkbox("ピーク位置 (▼) を表示・編集する", value=True)
     prominence_val = st.slider("自動検出の感度 (ノイズ除去)", min_value=0.01, max_value=0.5, value=0.1, step=0.01)
+    
+    st.markdown("---")
+    st.subheader("スムージング (ノイズ除去)")
+    apply_smoothing = st.checkbox("波形をなめらかにする", value=False)
+    if apply_smoothing:
+        smooth_window = st.slider("なめらかさの強さ (大きいほど強力)", min_value=3, max_value=51, value=11, step=2)
+    else:
+        smooth_window = 11
 
 # --- タブ3：凡例の設定 ---
 with tab3:
@@ -68,10 +99,6 @@ with tab3:
     else:
         legend_loc = None
 
-# --- データ処理（正規化関数） ---
-def normalize(y):
-    return (y - np.min(y)) / (np.max(y) - np.min(y))
-
 default_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
 
 # --- メイン画面（ファイルアップロードと描画） ---
@@ -82,26 +109,27 @@ if not uploaded_files:
         st.info("データをアップロードすると、ここに個別設定が表示されます。")
 
 if uploaded_files:
-    # 【変更】figsizeの横幅にスライダーの変数(fig_width)を適用
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     
-    # --- タブ4：各データと個別ピークの詳細設定 ---
     with tab4:
         st.header("各データと個別ピークの詳細設定")
 
         for i, file in enumerate(uploaded_files):
             st.markdown(f"**■ データ {i+1}**")
             
-            lines = [line.decode('utf-8', errors='ignore') for line in file]
             try:
-                x, y = np.loadtxt(lines, comments='*', usecols=(0, 1), unpack=True)
-                y_norm = normalize(y)
+                # ファイルの中身を読み込んでキャッシュ関数に渡す
+                file_bytes = file.getvalue()
+                x, y = load_data(file_bytes)
+                
+                # スムージングと正規化（これもキャッシュで爆速化）
+                y_norm = process_signal(y, apply_smoothing, smooth_window, 2)
                 y_shifted = y_norm + (i * offset)
                 
                 label_name = st.text_input("ラベル名", value=file.name, key=f"label_{i}")
                 line_col_default = default_colors[i % len(default_colors)]
                 
-                # --- ピークの検出処理 ---
+                # ピークの検出処理
                 all_peaks = []
                 if show_peaks:
                     peaks_auto, _ = find_peaks(y_norm, prominence=prominence_val)
@@ -127,7 +155,7 @@ if uploaded_files:
                 
                 num_peaks = len(all_peaks)
 
-                # --- 一括設定UI ---
+                # 一括設定UI
                 c1, c2, c3, c4 = st.columns(4)
                 with c1:
                     line_color = st.color_picker("波形(線)の色", line_col_default, key=f"line_color_{i}")
@@ -142,6 +170,8 @@ if uploaded_files:
                                     on_change=sync_bulk_offset, args=(i, num_peaks))
                 
                 ax.plot(x, y_shifted, label=label_name, color=line_color)
+                
+                final_peaks_data = [] # CSV出力用のデータ保管リスト
                 
                 if show_peaks:
                     with st.expander(f"ピークの編集 (計 {num_peaks} 個)"):
@@ -167,11 +197,29 @@ if uploaded_files:
                             if keep_peak:
                                 target_idx = np.abs(x - edited_x).argmin()
                                 ax.plot(x[target_idx], y_shifted[target_idx] + ind_off, "v", color=ind_color, markersize=ind_size)
+                                
+                                # 表示されているピークのデータをリストに追加
+                                final_peaks_data.append({
+                                    "2Theta": round(x[target_idx], 3),
+                                    "Intensity(Norm)": round(y_norm[target_idx], 4)
+                                })
+                
+                # --- 【アップデート3】CSVダウンロードボタンの追加 ---
+                if final_peaks_data:
+                    df_peaks = pd.DataFrame(final_peaks_data)
+                    csv = df_peaks.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label=f"📥 {label_name} のピークリスト (CSV) をダウンロード",
+                        data=csv,
+                        file_name=f"{label_name}_peaks.csv",
+                        mime="text/csv",
+                        key=f"dl_{i}"
+                    )
                 
                 st.markdown("---")
                 
             except Exception as e:
-                st.error(f"{file.name} の読み込みに失敗しました。")
+                st.error(f"{file.name} の読み込みに失敗しました。ファイル形式を確認してください。")
 
     # --- 7. 軸の調整と装飾 ---
     ax.set_xlim(x_min, x_max)
