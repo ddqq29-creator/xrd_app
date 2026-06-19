@@ -1,6 +1,6 @@
 streamlit
 numpy
 matplotlib
-scipy.signal
+scipy
 re
 
